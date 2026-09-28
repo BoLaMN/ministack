@@ -406,21 +406,85 @@ def test_delete_an_annotation(s3):
     s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
 
 
-def test_governance_lock_needs_the_bypass_to_delete_an_annotation(s3):
-    bucket = _bucket(s3, ObjectLockEnabledForBucket=True)
-    until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
-    s3.put_object(Bucket=bucket, Key="k", Body=b"x", ObjectLockMode="GOVERNANCE", ObjectLockRetainUntilDate=until)
-    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
-    with pytest.raises(ClientError) as exc:
-        s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
-    assert _code(exc) == "AccessDenied"
+# Observed on AWS (ap-southeast-2, 2026-09-28): annotations are writes to the object version, so Object Lock guards
+# PutObjectAnnotation and DeleteObjectAnnotation alike. Governance retention yields to
+# x-amz-bypass-governance-retention; compliance retention and a legal hold refuse both, bypass or not.
+
+
+def _bypassing(operation):
     raw = make_client("s3")
 
     def bypass(request, **_):
         request.headers["x-amz-bypass-governance-retention"] = "true"
 
-    raw.meta.events.register("before-sign.s3.DeleteObjectAnnotation", bypass)
-    raw.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+    raw.meta.events.register(f"before-sign.s3.{operation}", bypass)
+    return raw
+
+
+def _refused(call, message):
+    with pytest.raises(ClientError) as exc:
+        call()
+    assert _code(exc) == "AccessDenied"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 403
+    assert exc.value.response["Error"]["Message"] == message
+
+
+def _locked(s3, **lock):
+    bucket = _bucket(s3, ObjectLockEnabledForBucket=True)
+    s3.put_object(Bucket=bucket, Key="k", Body=b"x", **lock)
+    return bucket
+
+
+def _until():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3600))
+
+
+RETENTION = "Access Denied because object protected by object lock retention."
+LEGAL_HOLD = "Access Denied because object protected by object lock legal hold."
+
+
+def test_governance_retention_needs_the_bypass_to_put_or_delete_an_annotation(s3):
+    bucket = _locked(s3, ObjectLockMode="GOVERNANCE", ObjectLockRetainUntilDate=_until())
+    _refused(lambda: s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1"), RETENTION)
+    _bypassing("PutObjectAnnotation").put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    _refused(lambda: s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"2"), RETENTION)
+    _refused(lambda: s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a"), RETENTION)
+    _bypassing("DeleteObjectAnnotation").delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+
+
+def test_compliance_retention_refuses_annotation_writes_even_with_the_bypass(s3):
+    bucket = _locked(s3, ObjectLockMode="COMPLIANCE", ObjectLockRetainUntilDate=_until())
+    def put(c):
+        return c.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+
+    def delete(c):
+        return c.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+
+    _refused(lambda: put(s3), RETENTION)
+    _refused(lambda: put(_bypassing("PutObjectAnnotation")), RETENTION)
+    _refused(lambda: delete(s3), RETENTION)
+    _refused(lambda: delete(_bypassing("DeleteObjectAnnotation")), RETENTION)
+
+
+def test_a_legal_hold_refuses_annotation_writes_even_with_the_bypass(s3):
+    bucket = _locked(s3, ObjectLockLegalHoldStatus="ON")
+    def put(c):
+        return c.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+
+    def delete(c):
+        return c.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
+
+    _refused(lambda: put(s3), LEGAL_HOLD)
+    _refused(lambda: put(_bypassing("PutObjectAnnotation")), LEGAL_HOLD)
+    _refused(lambda: delete(s3), LEGAL_HOLD)
+    _refused(lambda: delete(_bypassing("DeleteObjectAnnotation")), LEGAL_HOLD)
+
+
+def test_an_unlocked_object_in_a_lock_enabled_bucket_takes_annotations_freely(s3):
+    bucket = _locked(s3)
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"1")
+    s3.put_object_annotation(Bucket=bucket, Key="k", AnnotationName="a", AnnotationPayload=b"2")
+    s3.delete_object_annotation(Bucket=bucket, Key="k", AnnotationName="a")
 
 
 # ── CopyObject ─────────────────────────────────────────────────────────

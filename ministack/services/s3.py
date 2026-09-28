@@ -5547,6 +5547,29 @@ def _annotation_checksum_headers(entry: dict) -> dict:
     return out
 
 
+def _annotation_lock_error(bucket_name: str, key: str, headers: dict) -> tuple | None:
+    """Object Lock over an annotation write (put, overwrite or delete), as AWS answers it.
+
+    Observed on AWS (ap-southeast-2, 2026-09-28): governance retention refuses
+    both unless x-amz-bypass-governance-retention is true; compliance retention
+    and a legal hold refuse both whatever the header says. Each refusal is 403
+    AccessDenied, naming retention or the legal hold.
+    """
+    if _object_legal_hold.get((bucket_name, key)) == "ON":
+        return _error("AccessDenied", "Access Denied because object protected by object lock legal hold.", 403)
+    retention = _object_retention.get((bucket_name, key))
+    if not retention:
+        return None
+    retain_until = retention.get("RetainUntilDate", "")
+    if not retain_until or retain_until <= now_iso():
+        return None
+    mode = retention.get("Mode", "")
+    bypass = headers.get("x-amz-bypass-governance-retention", "").lower() == "true"
+    if mode == "COMPLIANCE" or (mode == "GOVERNANCE" and not bypass):
+        return _error("AccessDenied", "Access Denied because object protected by object lock retention.", 403)
+    return None
+
+
 def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict):
     name = _qp(query_params, "annotationName", "")
     name_error = _annotation_name_error(name)
@@ -5556,6 +5579,9 @@ def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dic
     if error:
         return error
     bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers)
+    if lock_error:
+        return lock_error
     precondition = _annotation_if_match(headers, record)
     if precondition:
         return precondition
@@ -5724,11 +5750,7 @@ def _delete_object_annotation(bucket_name: str, key: str, headers: dict, query_p
     if error:
         return error
     bucket, version_key, record = target
-    # "If the object is protected by Object Lock in governance mode, you must
-    # also include the x-amz-bypass-governance-retention header." Compliance
-    # mode and a legal hold refuse it as they refuse the object's own delete
-    # (inference for those two).
-    lock_error = _check_object_lock(bucket_name, key, headers)
+    lock_error = _annotation_lock_error(bucket_name, key, headers)
     if lock_error:
         return lock_error
     precondition = _annotation_if_match(headers, record)
